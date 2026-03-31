@@ -282,7 +282,6 @@ def main(
                 dt = pred[k].dtype
                 if (dt == np.float32) and (dt != np.float16):
                     pred[k] = pred[k].astype(np.float16)
-
         with h5py.File(str(feature_path), "a", libver="latest") as fd:
             try:
                 if name in fd:
@@ -306,6 +305,11 @@ def main(
     logger.info("Finished exporting features.")
     return feature_path
 
+@torch.no_grad()
+def load_model(conf, device):
+    Model = dynamic_load(extractors, conf["model"]["name"])
+    model = Model(conf["model"]).eval().to(device)
+    return model
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

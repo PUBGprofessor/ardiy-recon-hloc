@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from . import logger
 from .utils.geometry import compute_epipolar_errors
-from .utils.io import get_keypoints, get_matches
+from .utils.io import get_keypoints, get_matches, list_h5_names
 from .utils.parsers import parse_retrieval
 
 
@@ -26,7 +26,9 @@ class OutputCapture:
 
 
 def create_db_from_model(
-    reconstruction: pycolmap.Reconstruction, database_path: Path
+    reconstruction: pycolmap.Reconstruction,
+    database_path: Path,
+    image_names: Optional[set[str]] = None,
 ) -> Dict[str, int]:
     if database_path.exists():
         logger.warning("The database already exists, deleting it.")
@@ -35,13 +37,15 @@ def create_db_from_model(
     with pycolmap.Database.open(database_path) as db:
         for camera_id, camera in reconstruction.cameras.items():
             db.write_camera(camera, use_camera_id=True)
-        for rig_id, rig in reconstruction.rigs.items():
-            db.write_rig(rig, use_rig_id=True)
-        for frame_id, frame in reconstruction.frames.items():
-            db.write_frame(frame, use_frame_id=True)
         for image_id, image in reconstruction.images.items():
+            if image_names is not None and image.name not in image_names:
+                continue
             db.write_image(image, use_image_id=True)
-    return {image.name: image_id for image_id, image in reconstruction.images.items()}
+    return {
+        image.name: image_id
+        for image_id, image in reconstruction.images.items()
+        if image_names is None or image.name in image_names
+    }
 
 
 def import_features(
@@ -208,8 +212,26 @@ def main(
     sfm_dir.mkdir(parents=True, exist_ok=True)
     database = sfm_dir / "database.db"
     reference = pycolmap.Reconstruction(reference_model)
+    pairs_dict = parse_retrieval(pairs)
+    pair_image_names = set(pairs_dict.keys()) | {
+        name for refs in pairs_dict.values() for name in refs
+    }
+    feature_image_names = set(list_h5_names(features))
+    selected_image_names = pair_image_names & feature_image_names
+    if not selected_image_names:
+        raise RuntimeError(
+            "No overlapping images between the triangulation pairs and the feature file."
+        )
+    skipped_images = len(reference.images) - len(selected_image_names)
+    if skipped_images > 0:
+        logger.info(
+            "Restricting triangulation to %d images present in both pairs and features; "
+            "skipping %d reference-model images outside the current train subset.",
+            len(selected_image_names),
+            skipped_images,
+        )
 
-    image_ids = create_db_from_model(reference, database)
+    image_ids = create_db_from_model(reference, database, selected_image_names)
     with pycolmap.Database.open(database) as db:
         import_features(image_ids, db, features)
         import_matches(

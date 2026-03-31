@@ -13,6 +13,12 @@ from .utils.io import get_keypoints, get_matches, write_poses
 from .utils.parsers import parse_image_lists, parse_retrieval
 
 
+def _serialize_pnp_ret(ret):
+    if ret is None:
+        return None
+    return {k: v for k, v in ret.items() if k not in {"cam_from_world", "camera"}}
+
+
 def do_covisibility_clustering(
     frame_ids: List[int], reconstruction: pycolmap.Reconstruction
 ):
@@ -117,7 +123,7 @@ def pose_from_cluster(
     ]
     log = {
         "db": db_ids,
-        "PnP_ret": ret,
+        "PnP_ret": _serialize_pnp_ret(ret),
         "keypoints_query": kpq[mkp_idxs],
         "points3D_ids": mp3d_ids,
         "points3D_xyz": None,  # we don't log xyz anymore because of file size
@@ -129,7 +135,7 @@ def pose_from_cluster(
 
 def main(
     reference_sfm: Union[Path, pycolmap.Reconstruction],
-    queries: Path,
+    queries,
     retrieval: Path,
     features: Path,
     matches: Path,
@@ -137,13 +143,15 @@ def main(
     ransac_thresh: int = 12,
     covisibility_clustering: bool = False,
     prepend_camera_name: bool = False,
+    fallback_to_nearest_db: bool = True,
     config: Dict = None,
 ):
     assert retrieval.exists(), retrieval
     assert features.exists(), features
     assert matches.exists(), matches
 
-    queries = parse_image_lists(queries, with_intrinsics=True)
+    if isinstance(queries, (str, Path)):
+        queries = parse_image_lists(Path(queries), with_intrinsics=True)
     retrieval_dict = parse_retrieval(retrieval)
 
     logger.info("Reading the 3D model...")
@@ -202,9 +210,13 @@ def main(
             )
             if ret is not None:
                 cam_from_world[qname] = ret["cam_from_world"]
+                log["used_fallback"] = False
             else:
-                closest = reference_sfm.images[db_ids[0]]
-                cam_from_world[qname] = closest.cam_from_world()
+                log["used_fallback"] = False
+                if fallback_to_nearest_db:
+                    closest = reference_sfm.images[db_ids[0]]
+                    cam_from_world[qname] = closest.cam_from_world()
+                    log["used_fallback"] = True
             log["covisibility_clustering"] = covisibility_clustering
             logs["loc"][qname] = log
 

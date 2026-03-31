@@ -56,6 +56,38 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     return images
 
 
+def normalize_mapper_options(
+    database_path: Path,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if options is None:
+        return {}
+
+    normalized = dict(options)
+
+    def expand_constant_cameras(value: Any) -> Any:
+        if value is True:
+            with pycolmap.Database.open(database_path) as db:
+                return {camera.camera_id for camera in db.read_all_cameras()}
+        if value is False:
+            return set()
+        return value
+
+    if "constant_cameras" in normalized:
+        normalized["constant_cameras"] = expand_constant_cameras(
+            normalized["constant_cameras"]
+        )
+
+    mapper_options = normalized.get("mapper")
+    if isinstance(mapper_options, dict) and "constant_cameras" in mapper_options:
+        normalized["mapper"] = dict(mapper_options)
+        normalized["mapper"]["constant_cameras"] = expand_constant_cameras(
+            mapper_options["constant_cameras"]
+        )
+
+    return normalized
+
+
 def incremental_mapping(
     database_path: Path,
     image_dir: Path,
@@ -63,6 +95,7 @@ def incremental_mapping(
     options: Optional[Dict[str, Any]] = None,
 ) -> dict[int, pycolmap.Reconstruction]:
     num_images = pycolmap.Database.open(database_path).num_images()
+    options = normalize_mapper_options(database_path, options)
     pbars = []
 
     def restart_progress_bar():
@@ -82,7 +115,7 @@ def incremental_mapping(
         database_path,
         image_dir,
         sfm_path,
-        options=options or {},
+        options=options,
         initial_image_pair_callback=restart_progress_bar,
         next_image_callback=lambda: pbars[-1].update(1),
     )
