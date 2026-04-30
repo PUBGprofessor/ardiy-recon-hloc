@@ -18,8 +18,8 @@ from hloc import extract_features, logger, match_features, matchers
 from hloc.localize_sfm import QueryLocalizer
 from hloc.utils.base_model import dynamic_load
 import sys
-sys.path.append('../')
-sys.argv=r'run_reloc_server.py --root_dir F:\dev2\prjs1\data1\office3 --map_dir hloc_map --default_camera_model PINHOLE --train_list scan1/image_list.txt --device cuda:0 --retvis'.split()
+#sys.path.append('../')
+#sys.argv=r'run_reloc_server.py --root_dir F:\dev2\prjs1\data1\office3 --map_dir hloc_map --default_camera_model PINHOLE --train_list scan1/image_list.txt --device cuda:0 --retvis'.split()
 
 #e.g. python run_reloc_server.py --map_dir "F:\dev2\prjs1\data1\office2\hloc_map" --default_camera_model PINHOLE --default_camera_params "615.0,615.0,320.0,240.0" 
 # --test_image "F:\dev2\prjs1\data1\office2\scan2\color\000001.jpg" --device cuda --gpu_id 0
@@ -246,6 +246,29 @@ def parse_args():
         type=Path,
         help="Optional path where the test response is written as JSON.",
     )
+    parser.add_argument(
+        "--host",
+        "--ip",
+        dest="host",
+        type=str,
+        default="localhost",
+        help=(
+            "Server bind IP address. Defaults to localhost, which xbase.netcall "
+            "resolves to the current local IP."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server bind port. Defaults to 8000.",
+    )
+    parser.add_argument(
+        "--log_server_response",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to log the minimal server response for each request.",
+    )
     args = parser.parse_args()
     if args.config is None and args.map_dir is None:
         parser.error("Either --map_dir or --config must be provided.")
@@ -416,6 +439,8 @@ def build_minimal_server_response(response: dict) -> dict:
             [r[1][0], r[1][1], r[1][2], t[1]],
             [r[2][0], r[2][1], r[2][2], t[2]],
         ], dtype=np.float32)
+    else:
+        pose=np.eye(4, dtype=np.float32)
 
     minimal = {
         "pose": pose,
@@ -991,7 +1016,11 @@ class RelocServiceManager:
         return self.services[map_name]
 
 
-def make_server_handler(service: RelocService | None = None, manager: RelocServiceManager | None = None):
+def make_server_handler(
+    service: RelocService | None = None,
+    manager: RelocServiceManager | None = None,
+    log_server_response: bool = True,
+):
     def server_handler(objs):
         if "image" not in objs:
             raise ValueError("Expected request dict with an 'image' field containing a BGR ndarray.")
@@ -1006,7 +1035,8 @@ def make_server_handler(service: RelocService | None = None, manager: RelocServi
             active_service = manager.get_service(str(map_name))
         response = active_service.localize(image, objs)
         minimal_response = build_minimal_server_response(response)
-        logger.info("server_handler response: %s", minimal_response)
+        if log_server_response:
+            logger.info("response: num_inliers=%d, inlier_ratio=%f", minimal_response["num_inliers"], minimal_response["inlier_ratio"])
         return minimal_response
 
     return server_handler
@@ -1048,7 +1078,12 @@ def main():
         )
 
     logger.info("Reloc service is ready.")
-    netcall.runServer(make_server_handler(service, manager))
+    logger.info("Starting reloc server on %s:%d", args.host, args.port)
+    netcall.runServer(
+        make_server_handler(service, manager, log_server_response=args.log_server_response),
+        port=args.port,
+        ip=args.host,
+    )
 
 
 if __name__ == "__main__":

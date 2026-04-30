@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pycolmap
+import torch
 
 from hloc import extract_features, logger, match_features, pairs_from_retrieval
 from hloc import reconstruction as reconstruction_module
@@ -89,6 +90,16 @@ def parse_args():
         type=int,
         default=20,
         help="Number of retrieved neighbors when --native_pairing retrieval is used.",
+    )
+    parser.add_argument(
+        "--native_cross_list_min_matched",
+        type=int,
+        default=10,
+        help=(
+            "When multiple --image_list are provided with --native_pairing retrieval, "
+            "reserve at least this many matches per query for images from other image lists in total. "
+            "0 disables list-aware balancing."
+        ),
     )
     parser.add_argument(
         "--camera_info",
@@ -275,9 +286,109 @@ def merge_image_lists(image_list_paths: list[Path]) -> tuple[list[str], dict[Pat
     return merged, names_by_list
 
 
+def build_image_to_list_id(names_by_list: dict[Path, list[str]]) -> dict[str, int]:
+    image_to_list_id = {}
+    for list_id, (_, image_names) in enumerate(names_by_list.items()):
+        for image_name in image_names:
+            image_to_list_id.setdefault(image_name, list_id)
+    return image_to_list_id
+
+
 def write_image_list(image_list_path: Path, image_names: list[str]) -> None:
     image_list_path.parent.mkdir(parents=True, exist_ok=True)
     image_list_path.write_text("\n".join(image_names) + "\n", encoding="utf-8")
+
+
+def write_pairs(pairs_path: Path, pairs: list[tuple[str, str]]) -> None:
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(
+        "\n".join(f"{name0} {name1}" for name0, name1 in pairs) + "\n",
+        encoding="utf-8",
+    )
+
+
+def generate_list_balanced_retrieval_pairs(
+    retrieval_path: Path,
+    pairs_path: Path,
+    image_names: list[str],
+    image_to_list_id: dict[str, int],
+    num_matched: int,
+    cross_list_min_matched: int,
+) -> None:
+    if cross_list_min_matched <= 0:
+        raise ValueError("cross_list_min_matched must be > 0 for list-balanced retrieval pairing.")
+
+    db_names = list(image_names)
+    query_names = list(image_names)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    descriptors = pairs_from_retrieval.get_descriptors(query_names, retrieval_path)
+    sim = torch.einsum("id,jd->ij", descriptors.to(device), descriptors.to(device))
+    sim = sim.cpu()
+
+    db_names_arr = np.array(db_names)
+    list_ids = np.array([image_to_list_id[name] for name in db_names], dtype=np.int32)
+    unique_list_ids = np.unique(list_ids)
+
+    pairs = []
+    for query_idx, query_name in enumerate(query_names):
+        query_list_id = image_to_list_id[query_name]
+        selected_db_indices = []
+        other_list_ids = [list_id for list_id in unique_list_ids if list_id != query_list_id]
+        if other_list_ids:
+            total_cross_quota = min(cross_list_min_matched, num_matched)
+            base_quota = total_cross_quota // len(other_list_ids)
+            remainder = total_cross_quota % len(other_list_ids)
+        else:
+            total_cross_quota = 0
+            base_quota = 0
+            remainder = 0
+
+        for offset, other_list_id in enumerate(other_list_ids):
+            invalid = np.ones(len(db_names), dtype=bool)
+            valid_mask = list_ids == other_list_id
+            invalid[valid_mask] = False
+
+            quota = base_quota + (1 if offset < remainder else 0)
+            num_select = min(quota, int(np.count_nonzero(valid_mask)))
+            if num_select <= 0:
+                continue
+
+            sub_pairs = pairs_from_retrieval.pairs_from_score_matrix(
+                sim[query_idx : query_idx + 1].clone(),
+                invalid[None],
+                num_select=num_select,
+                min_score=0,
+            )
+            selected_db_indices.extend(db_idx for _, db_idx in sub_pairs)
+
+        if len(selected_db_indices) < num_matched:
+            invalid = np.zeros(len(db_names), dtype=bool)
+            invalid[query_idx] = True
+            if selected_db_indices:
+                invalid[np.array(selected_db_indices, dtype=np.int64)] = True
+
+            num_select = min(num_matched - len(selected_db_indices), len(db_names) - int(np.sum(invalid)))
+            if num_select > 0:
+                sub_pairs = pairs_from_retrieval.pairs_from_score_matrix(
+                    sim[query_idx : query_idx + 1].clone(),
+                    invalid[None],
+                    num_select=num_select,
+                    min_score=0,
+                )
+                selected_db_indices.extend(db_idx for _, db_idx in sub_pairs)
+
+        for db_idx in selected_db_indices[:num_matched]:
+            if db_names_arr[db_idx] == query_name:
+                continue
+            pairs.append((query_name, db_names_arr[db_idx]))
+
+    logger.info(
+        "Found %d list-balanced retrieval pairs with cross-list minimum %d per query.",
+        len(pairs),
+        cross_list_min_matched,
+    )
+    write_pairs(pairs_path, pairs)
 
 
 def parse_camera_info_file(camera_info_path: Path, default_camera_model: str) -> dict:
@@ -842,10 +953,16 @@ def run_reconstruction_with_explicit_cameras(
 
 def main():
     args = parse_args()
+    if args.native_cross_list_min_matched < 0:
+        raise ValueError("--native_cross_list_min_matched must be >= 0.")
+    if args.native_cross_list_min_matched > args.native_num_matched:
+        raise ValueError("--native_cross_list_min_matched cannot exceed --native_num_matched.")
+
     outputs = args.outputs
     outputs.mkdir(parents=True, exist_ok=True)
 
     image_names, names_by_list = merge_image_lists(args.image_list)
+    image_to_list_id = build_image_to_list_id(names_by_list)
     verify_images_exist(args.image_dir, image_names)
     write_image_list(outputs / "train_images.txt", image_names)
 
@@ -873,6 +990,7 @@ def main():
         "matcher_conf": args.matcher_conf,
         "native_pairing": args.native_pairing,
         "native_num_matched": args.native_num_matched,
+        "native_cross_list_min_matched": args.native_cross_list_min_matched,
         "fix_intrinsics": args.fix_intrinsics,
         "image_lists": [str(path) for path in args.image_list],
         "camera_info_files": [str(path) for path in args.camera_info] if args.camera_info else [],
@@ -914,14 +1032,27 @@ def main():
     if args.native_pairing == "exhaustive":
         pairs_from_exhaustive.main(sfm_pairs, image_list=image_names)
     else:
-        pairs_from_retrieval.main(
-            retrieval_path,
-            sfm_pairs,
-            args.native_num_matched,
-            query_list=image_names,
-            db_list=image_names,
-            db_descriptors=retrieval_path,
+        use_list_balanced_retrieval = (
+            len(names_by_list) > 1 and args.native_cross_list_min_matched > 0
         )
+        if use_list_balanced_retrieval:
+            generate_list_balanced_retrieval_pairs(
+                retrieval_path=retrieval_path,
+                pairs_path=sfm_pairs,
+                image_names=image_names,
+                image_to_list_id=image_to_list_id,
+                num_matched=args.native_num_matched,
+                cross_list_min_matched=args.native_cross_list_min_matched,
+            )
+        else:
+            pairs_from_retrieval.main(
+                retrieval_path,
+                sfm_pairs,
+                args.native_num_matched,
+                query_list=image_names,
+                db_list=image_names,
+                db_descriptors=retrieval_path,
+            )
 
     matches_path = match_features.main(
         matcher_conf,
