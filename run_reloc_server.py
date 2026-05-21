@@ -125,6 +125,11 @@ def add_service_args(parser: argparse.ArgumentParser, require_map_dir: bool) -> 
         action="store_true",
         help="Return inlier visualization image (query vs matched DB frame) in server response.",
     )
+    parser.add_argument(
+        "--rotation_augmentation",
+        action="store_true",
+        help="Run localization on 0/90/180/270 query rotations and pick the best inlier result.",
+    )
 
 
 def resolve_config_tokens(tokens: list[str], config_dir: Path) -> list[str]:
@@ -159,6 +164,7 @@ def build_service_defaults(args) -> dict:
         "default_camera_params": args.default_camera_params,
         "fallback_to_nearest_db": args.fallback_to_nearest_db,
         "retvis": args.retvis,
+        "rotation_augmentation": args.rotation_augmentation,
         "train_list": args.train_list,
         "image_path": args.image_path,
     }
@@ -488,6 +494,7 @@ class RelocService:
         default_camera_params: str | None,
         fallback_to_nearest_db: bool,
         retvis: bool,
+        rotation_augmentation: bool,
     ):
         self.map_dir = map_dir
         self.num_retrieval = num_retrieval
@@ -504,6 +511,7 @@ class RelocService:
         self.default_camera_params = default_camera_params
         self.fallback_to_nearest_db = fallback_to_nearest_db
         self.retvis = retvis
+        self.rotation_augmentation = rotation_augmentation
 
         self.retrieval_conf = extract_features.confs[retrieval_conf_name]
         self.local_feature_conf = extract_features.confs[local_feature_conf_name]
@@ -726,6 +734,46 @@ class RelocService:
         db_pts = np.asarray([db_kpts[kp_idx] for _, kp_idx in best_matches], dtype=np.float32)
         return self._draw_inlier_visualization(query_image_bgr, db_image, query_pts, db_pts)
 
+    @staticmethod
+    def _rotate_image(image_bgr: np.ndarray, rotation_deg: int) -> np.ndarray:
+        if rotation_deg == 0:
+            return image_bgr
+        if rotation_deg == 90:
+            return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+        if rotation_deg == 180:
+            return cv2.rotate(image_bgr, cv2.ROTATE_180)
+        if rotation_deg == 270:
+            return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        raise ValueError(f"Unsupported rotation degree {rotation_deg}. Expected one of [0, 90, 180, 270].")
+
+    @staticmethod
+    def _map_keypoints_rotated_to_original(
+        keypoints_xy: np.ndarray,
+        rotation_deg: int,
+        original_width: int,
+        original_height: int,
+    ) -> np.ndarray:
+        if rotation_deg == 0:
+            return keypoints_xy
+
+        mapped = np.empty_like(keypoints_xy, dtype=np.float32)
+        x = keypoints_xy[:, 0]
+        y = keypoints_xy[:, 1]
+
+        if rotation_deg == 90:
+            mapped[:, 0] = y
+            mapped[:, 1] = (original_height - 1) - x
+        elif rotation_deg == 180:
+            mapped[:, 0] = (original_width - 1) - x
+            mapped[:, 1] = (original_height - 1) - y
+        elif rotation_deg == 270:
+            mapped[:, 0] = (original_width - 1) - y
+            mapped[:, 1] = x
+        else:
+            raise ValueError(f"Unsupported rotation degree {rotation_deg}. Expected one of [0, 90, 180, 270].")
+
+        return mapped
+
     @torch.inference_mode()
     def extract_global(self, image_bgr: np.ndarray) -> torch.Tensor:
         image, _ = preprocess_image(image_bgr, self.retrieval_conf["preprocessing"])
@@ -848,42 +896,96 @@ class RelocService:
         min_matched_db = int(request.get("min_matched_db", self.min_matched_db))
         fallback_to_nearest_db = bool(request.get("fallback_to_nearest_db", self.fallback_to_nearest_db))
         retvis = bool(request.get("retvis", self.retvis))
+        rotation_augmentation = bool(request.get("rotation_augmentation", self.rotation_augmentation))
         camera_model = request.get("camera_model", self.default_camera_model)
         camera_params = request.get("camera_params", self.default_camera_params)
+ 
+        #print image size and camera_params
+        logger.info("Received localization request with image of shape %s and camera_params %s", image_bgr.shape, camera_params)
 
         timings = {}
         time_start = time.perf_counter()
         query_camera = build_camera_from_array(image_bgr, camera_model, camera_params)
         timings["camera_s"] = time.perf_counter() - time_start
 
-        time_global = time.perf_counter()
-        query_desc = self.extract_global(image_bgr)
-        timings["global_s"] = time.perf_counter() - time_global
+        rotation_candidates = [0, 90, 180, 270] if rotation_augmentation else [0]
+        original_height, original_width = image_bgr.shape[:2]
+        best_candidate = None
+        global_time_total = 0.0
+        retrieve_time_total = 0.0
+        local_time_total = 0.0
+        match_time_total = 0.0
+        pnp_time_total = 0.0
 
-        time_retrieve = time.perf_counter()
-        retrieved_names, retrieval_scores = self.retrieve(query_desc, num_retrieval)
-        timings["retrieve_s"] = time.perf_counter() - time_retrieve
+        for rotation_deg in rotation_candidates:
+            image_for_candidate = self._rotate_image(image_bgr, rotation_deg)
 
-        time_local = time.perf_counter()
-        query_local = self.extract_local(image_bgr)
-        timings["local_s"] = time.perf_counter() - time_local
+            time_global = time.perf_counter()
+            query_desc = self.extract_global(image_for_candidate)
+            global_time_total += time.perf_counter() - time_global
 
-        time_match = time.perf_counter()
-        mkp_indices, point3d_ids, match_stats = self.build_correspondences(
-            query_local,
-            retrieved_names,
-            num_match_db,
-            min_correspondences,
-            min_matched_db,
-        )
-        timings["match_s"] = time.perf_counter() - time_match
+            time_retrieve = time.perf_counter()
+            retrieved_names, retrieval_scores = self.retrieve(query_desc, num_retrieval)
+            retrieve_time_total += time.perf_counter() - time_retrieve
 
-        query_keypoints = query_local["keypoints"][0].detach().cpu().numpy() + 0.5
-        time_pnp = time.perf_counter()
-        result = None
+            time_local = time.perf_counter()
+            query_local = self.extract_local(image_for_candidate)
+            local_time_total += time.perf_counter() - time_local
+
+            time_match = time.perf_counter()
+            mkp_indices, point3d_ids, match_stats = self.build_correspondences(
+                query_local,
+                retrieved_names,
+                num_match_db,
+                min_correspondences,
+                min_matched_db,
+            )
+            match_time_total += time.perf_counter() - time_match
+
+            query_keypoints_rot = query_local["keypoints"][0].detach().cpu().numpy() + 0.5
+            query_keypoints = self._map_keypoints_rotated_to_original(
+                query_keypoints_rot,
+                rotation_deg,
+                original_width,
+                original_height,
+            )
+
+            time_pnp = time.perf_counter()
+            result = None
+            if point3d_ids:
+                result = self.localizer.localize(query_keypoints, mkp_indices, point3d_ids, query_camera)
+            pnp_time_total += time.perf_counter() - time_pnp
+
+            num_inliers = int(result.get("num_inliers", 0)) if result is not None else 0
+            num_corr = int(match_stats.get("num_correspondences", 0))
+            inlier_ratio = float(num_inliers / num_corr) if num_corr > 0 else 0.0
+            score_tuple = (num_inliers, inlier_ratio, num_corr)
+
+            candidate = {
+                "rotation_deg": rotation_deg,
+                "result": result,
+                "retrieved_names": retrieved_names,
+                "retrieval_scores": retrieval_scores,
+                "match_stats": match_stats,
+                "mkp_indices": mkp_indices,
+                "point3d_ids": point3d_ids,
+                "query_keypoints": query_keypoints,
+                "score": score_tuple,
+            }
+
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+
+        result = best_candidate["result"]
+        retrieved_names = best_candidate["retrieved_names"]
+        retrieval_scores = best_candidate["retrieval_scores"]
+        match_stats = best_candidate["match_stats"]
+        mkp_indices = best_candidate["mkp_indices"]
+        point3d_ids = best_candidate["point3d_ids"]
+        query_keypoints = best_candidate["query_keypoints"]
+        best_rotation_deg = int(best_candidate["rotation_deg"])
+
         used_fallback = False
-        if point3d_ids:
-            result = self.localizer.localize(query_keypoints, mkp_indices, point3d_ids, query_camera)
         if result is None and fallback_to_nearest_db and retrieved_names:
             used_fallback = True
             nearest = self.reconstruction.images[self.db_name_to_id[retrieved_names[0]]]
@@ -892,7 +994,12 @@ class RelocService:
             cam_from_world = result["cam_from_world"]
         else:
             cam_from_world = None
-        timings["pnp_s"] = time.perf_counter() - time_pnp
+
+        timings["global_s"] = float(global_time_total)
+        timings["retrieve_s"] = float(retrieve_time_total)
+        timings["local_s"] = float(local_time_total)
+        timings["match_s"] = float(match_time_total)
+        timings["pnp_s"] = float(pnp_time_total)
         timings["total_s"] = time.perf_counter() - time_start
 
         response = {
@@ -914,6 +1021,8 @@ class RelocService:
                 "num_match_db": num_match_db,
                 "min_correspondences": min_correspondences,
                 "min_matched_db": min_matched_db,
+                "rotation_augmentation": rotation_augmentation,
+                "best_rotation_deg": best_rotation_deg,
                 "train_list": str(self.train_list) if self.train_list is not None else None,
                 "num_train_db_images": len(self.db_image_names),
             },
@@ -991,6 +1100,7 @@ def build_service(
         default_camera_params=service_args.default_camera_params,
         fallback_to_nearest_db=service_args.fallback_to_nearest_db,
         retvis=service_args.retvis,
+        rotation_augmentation=service_args.rotation_augmentation,
     )
 
 
