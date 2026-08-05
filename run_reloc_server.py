@@ -1147,6 +1147,7 @@ def make_server_handler(
         minimal_response = build_minimal_server_response(response)
         if log_server_response:
             logger.info("response: num_inliers=%d, inlier_ratio=%f", minimal_response["num_inliers"], minimal_response["inlier_ratio"])
+            logger.info("pose=%s", minimal_response["pose"])
         return minimal_response
 
     return server_handler
