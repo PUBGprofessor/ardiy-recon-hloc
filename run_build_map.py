@@ -16,6 +16,19 @@ from hloc import pairs_from_exhaustive
 from hloc.triangulation import import_features, import_matches
 from hloc.utils.io import read_image
 
+# =============================================================================
+# 本文件作用：使用 HLOC 构建参考地图（稀疏重建 + 特征提取），为后续重定位做准备。
+#   1. 汇总多个图像列表，并为每张图像关联（可选的）相机内参；
+#   2. 提取图像级全局检索描述子，供检索式配对召回相似图像；
+#   3. 提取局部特征（默认 SuperPoint）；
+#   4. 生成匹配图像对：全排列(exhaustive) 或 基于检索(retrieval)；
+#   5. 用局部特征匹配器（默认 SuperGlue）计算匹配；
+#   6. 交给 COLMAP 增量式 SfM，得到稀疏点云、相机位姿与内参（sfm_reference）；
+#   7. 可选：借助深度图恢复真实尺度；用 TSDF 融合稠密点云/网格；
+#   8. 可选：导出 poses_optimized.txt 供下游定位直接使用；
+#   9. 写 build_info.json 记录本次建图配置与结果。
+# =============================================================================
+
 #python run_build_map.py --config build_map.txt --overwrite
 #python f:/devpy/hloc/run_build_map.py `
 #   --image_dir f:/dev2/prjs1/data1/office2 `
@@ -31,6 +44,7 @@ from hloc.utils.io import read_image
 #   --overwrite
 
 def parse_args():
+    "解析命令行参数。"
     argv = expand_config_args(sys.argv[1:])
     parser = argparse.ArgumentParser(
         description=(
@@ -166,6 +180,26 @@ def parse_args():
         type=float,
         default=4.0,
         help="Maximum valid depth in meters for metric scale recovery.",
+    )
+    parser.add_argument(
+        "--voxel_length",
+        type=float,
+        default=0.01,
+        help=(
+            "TSDF voxel size in meters for --dense fusion. To preserve thin structures, "
+            "use roughly 1/4 to 1/5 of the thinnest part you need to keep (e.g. 0.002-0.003 "
+            "for ~1-2cm thin parts). Finer voxels cost more memory/time."
+        ),
+    )
+    parser.add_argument(
+        "--sdf_trunc",
+        type=float,
+        default=0.04,
+        help=(
+            "TSDF truncation distance in meters for --dense fusion. Must be smaller than "
+            "half the thinnest structure's thickness, otherwise thin parts are erased "
+            "(e.g. for ~1-2cm thin parts use 0.008-0.012). Recommended 4-6x voxel_length."
+        ),
     )
     parser.add_argument(
         "--export_poses_file",
@@ -697,11 +731,29 @@ def build_dense_model_from_depth(
     depth_dir_name: str,
     min_depth: float,
     max_depth: float,
+    voxel_length: float = 0.01,
+    sdf_trunc: float = 0.04,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    voxel_length = 0.01
-    sdf_trunc = 0.04
+    if voxel_length <= 0 or sdf_trunc <= 0:
+        raise ValueError("--voxel_length and --sdf_trunc must be positive.")
+    if voxel_length > 0.004:
+        logger.warning(
+            "voxel_length=%.3fm is coarse: structures thinner than ~%.0fmm cannot be "
+            "represented. Use ~0.002-0.003m to keep ~1-2cm thin parts.",
+            voxel_length,
+            voxel_length * 1000 * 4,
+        )
+    if sdf_trunc > 0.02:
+        logger.warning(
+            "sdf_trunc=%.3fm is large: structures thinner than ~%.0fmm will be erased "
+            "by TSDF truncation (need thickness > 2*sdf_trunc). Use ~0.008-0.012m for "
+            "thin parts.",
+            sdf_trunc,
+            sdf_trunc * 1000 * 2,
+        )
+
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_length,
         sdf_trunc=sdf_trunc,
@@ -1001,6 +1053,8 @@ def main():
         "depth_dir_name": args.depth_dir_name,
         "min_depth": args.min_depth,
         "max_depth": args.max_depth,
+        "voxel_length": args.voxel_length,
+        "sdf_trunc": args.sdf_trunc,
         "export_poses_file": str(args.export_poses_file) if args.export_poses_file else None,
     }
 
@@ -1113,6 +1167,8 @@ def main():
             depth_dir_name=args.depth_dir_name,
             min_depth=args.min_depth,
             max_depth=args.max_depth,
+            voxel_length=args.voxel_length,
+            sdf_trunc=args.sdf_trunc,
         )
 
     if args.export_poses_file:
