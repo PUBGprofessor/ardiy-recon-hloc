@@ -167,3 +167,5 @@ if __name__ == "__main__":
 
     # 输出结果
     print("预测的位姿是：\n", np.round(batch["loftr_rt"].cpu().numpy(),4))
+    # 内点数量
+    print("内点数量：", batch["loftr_num_inliers"].item())

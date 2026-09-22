@@ -34,6 +34,8 @@ import torch
 import torch.nn.functional as F
 import os
 
+from scipy.spatial.transform import Rotation
+
 from hloc import extract_features, logger, match_features, matchers
 from hloc.localize_sfm import QueryLocalizer
 from hloc.utils.base_model import dynamic_load
@@ -49,10 +51,14 @@ logger = logging.getLogger(__name__)
 
 # 1. 将 mp3d_loftr 目录添加到 Python 模块搜索路径中
 mp3d_dir = Path(__file__).resolve().parent / "mp3d_loftr"
-if str(mp3d_dir) not in sys.path:
-    sys.path.insert(0, str(mp3d_dir))
+prior_ransac_dir = mp3d_dir / "third_party" / "prior_ransac"
 
-# 2. 此时可以直接导入 src，mp3d_loftr 内部的绝对导入也会正常工作
+# 依次插入 mp3d_loftr 及其依赖的子路径
+for path in [str(mp3d_dir), str(prior_ransac_dir)]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+# 2. 此时可以直接导入 src 与第三方库
 from src.config.default import get_cfg_defaults
 from src.lightning.lightning_loftr import PL_LoFTR
 import pytorch_lightning as pl
@@ -445,9 +451,24 @@ def build_camera_from_array(
     return pycolmap.Camera(model=camera_model, width=width, height=height, params=params)
 
 
-def serialize_cam_from_world(cam_from_world: pycolmap.Rigid3d) -> dict:
-    """将 world-to-cam 刚性变换序列化为 {'qvec': [qw,qx,qy,qz], 'tvec': [x,y,z]}（COLMAP 约定）。"""
-    # pycolmap 内部四元数顺序为 (x,y,z,w)，重排为 COLMAP 惯用的 (qw,qx,qy,qz)
+def serialize_cam_from_world(cam_from_world):
+    if cam_from_world is None:
+        return None
+
+    # 1. 如果传入的是 numpy.ndarray 变换矩阵 (4x4 或 3x4)
+    if isinstance(cam_from_world, np.ndarray):
+        R = cam_from_world[:3, :3]
+        t = cam_from_world[:3, 3]
+        
+        # scipy 的 as_quat() 返回 [x, y, z, w]，通过 [[3, 0, 1, 2]] 调换为 [w, x, y, z]
+        q_xyzw = Rotation.from_matrix(R).as_quat()
+        qvec = q_xyzw[[3, 0, 1, 2]].tolist()
+        tvec = t.tolist()
+        
+        # 保持与原函数返回的数据结构一致（如果原函数返回 list，请参照对应格式）
+        return {"qvec": qvec, "tvec": tvec}
+
+    # 2. 如果传入的是 PyCOLMAP 的 Rigid3d 对象
     qvec = cam_from_world.rotation.quat[[3, 0, 1, 2]].tolist()
     tvec = cam_from_world.translation.tolist()
     return {"qvec": qvec, "tvec": tvec}
@@ -1314,7 +1335,7 @@ class RelocService:
                     "depth1": torch.tensor([]).unsqueeze(0).cuda(),
                     "T_0to1": torch.tensor([]).unsqueeze(0).cuda(),
                     "T_1to0": torch.tensor([]).unsqueeze(0).cuda(),
-                    "dataset_name": ["custom"],
+                    "dataset_name": ["mp3d"],
                     "scene_id": torch.tensor([]).unsqueeze(0).cuda(),
                     "pair_id": 0,
                     "pair_names": ("query", db_name),
@@ -1327,6 +1348,7 @@ class RelocService:
                 # -------------------------------------------------------------
                 with torch.no_grad():
                     out_batch = self.far_model.test_step(batch, batch_idx=0, skip_eval=True)
+                    # out_batch = self.far_model(batch)
 
                 # 提取 FAR 预测的相对位姿 T_0to1 (3x4 或 4x4)
                 if "loftr_rt" in out_batch and out_batch["loftr_rt"] is not None:
@@ -1377,12 +1399,20 @@ class RelocService:
             
             # 1. 获取 DB 图像的世界坐标位姿 T_db_from_world
             db_image_obj = self.reconstruction.images[self.db_name_to_id[matched_db_name]]
-            T_db_from_world = db_image_obj.cam_from_world().to_matrix()  # 4x4 矩阵
+            
+            # 获取 3x4 变换矩阵 [R | t]
+            T_db_3x4 = db_image_obj.cam_from_world().matrix()
 
-            # 2. 几何推导：T_query_from_world = (T_0to1)^(-1) * T_db_from_world
+            # 2. 补齐为 4x4 齐次坐标变换矩阵
+            if T_db_3x4.shape == (3, 4):
+                T_db_from_world = np.vstack([T_db_3x4, [0, 0, 0, 1]])
+            else:
+                T_db_from_world = T_db_3x4
+
+            # 3. 进行 4x4 @ 4x4 齐次矩阵乘法
             T_query_from_world_rot = np.linalg.inv(T_0to1) @ T_db_from_world
 
-            # 3. 若存在图像旋转增广，对相对旋转做 Z 轴角度补偿
+            # 4. 若存在图像旋转增广，对相对旋转做 Z 轴角度补偿
             if best_rotation_deg != 0:
                 rad = np.radians(-best_rotation_deg)
                 R_z = np.array([
@@ -1399,7 +1429,7 @@ class RelocService:
             # PnP/FAR 失败时回退到距离最近的 Top-1 库图位姿
             used_fallback = True
             nearest = self.reconstruction.images[self.db_name_to_id[retrieved_names[0]]]
-            cam_from_world = nearest.cam_from_world().to_matrix()
+            cam_from_world = nearest.cam_from_world().matrix()
 
         # -------------------------------------------------------------
         # Step 5: 耗时统计与响应构建

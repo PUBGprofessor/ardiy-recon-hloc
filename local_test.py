@@ -10,7 +10,7 @@ from pathlib import Path
 # ==============================================================================
 # 1. 导入服务端模块 (若你的服务端文件名不是 server.py，请修改此处的 `server`)
 # ==============================================================================
-SERVER_MODULE_NAME = "run_reloc_server_old"  # <--- 请根据实际 Server 文件名修改（不要写 .py 后缀）
+SERVER_MODULE_NAME = "run_reloc_server"  # <--- 请根据实际 Server 文件名修改（不要写 .py 后缀）
 
 try:
     server_module = __import__(SERVER_MODULE_NAME)
