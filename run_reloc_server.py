@@ -619,7 +619,7 @@ class RelocService:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.far_h = 480
         self.far_w = 640
-        ckpt_path = "mp3d_loftr\\pretrained_models\\far_8pt.ckpt"
+        ckpt_path = "mp3d_loftr/pretrained_models/far_8pt.ckpt"
 
         # 初始化并加载 FAR 模型至 self.far_model
         logger.info("Initializing FAR model...")
@@ -628,6 +628,15 @@ class RelocService:
 
         # 预热模型，消化 CUDA kernel 编译等一次性开销
         self._warmup()
+
+        # 库图片路径
+        self.base_dir = Path(root_dir) # ../test/
+        self.color_dir = self.base_dir
+        self.camera_info_path = self.base_dir / "scan1" / "camera_info.txt"
+        
+        # 运行时内存缓存
+        self._db_image_cache = {}        # {db_name: gray_image_ndarray}
+        self._camera_params_cache = None # 存储解析后的内参字典或通用内参
 
     def _init_far_model(self, ckpt_path: str, config_path: str = None) -> torch.nn.Module:
         """参考 demo.py 的模型加载逻辑构建 far_model"""
@@ -1085,6 +1094,7 @@ class RelocService:
         }
         return mkp_indices, point3d_ids, stats
 
+    @staticmethod
     def _to_4x4_matrix(rt_matrix: np.ndarray) -> np.ndarray:
         """将 3x4 变换矩阵补全为 4x4 齐次变换矩阵。"""
         if rt_matrix.shape == (4, 4):
@@ -1096,14 +1106,26 @@ class RelocService:
         else:
             raise ValueError(f"Invalid RT matrix shape: {rt_matrix.shape}")
 
-    def _build_far_intrinsics(camera_params: list, orig_h: int, orig_w: int, target_h: int, target_w: int) -> torch.Tensor:
+    @staticmethod
+    def _build_far_intrinsics(camera_params, orig_h: int, orig_w: int, target_h: int, target_w: int) -> torch.Tensor:
         """构建适应 FAR 输入分辨率的相机内参矩阵 (1, 3, 3)。"""
-        # 假设 PINHOLE 模型参数为 [fx, fy, cx, cy]
-        fx, fy, cx, cy = camera_params[:4]
         
-        # 缩放内参以匹配 FAR 输入图像尺寸
-        scale_x = target_w / orig_w
-        scale_y = target_h / orig_h
+        # 1. 兼容性解析 camera_params
+        if isinstance(camera_params, str):
+            # 如果是客户端传来的逗号分隔字符串: "482.11,481.07,321.64,238.18"
+            # 按照逗号切分，并清理空格转为 float
+            params = [float(x.strip()) for x in camera_params.split(',')]
+        else:
+            # 如果传过来的是原生 list 或 numpy array
+            params = [float(x) for x in np.array(camera_params).flatten()]
+            
+        # 获取前 4 个参数 (fx, fy, cx, cy)
+        fx, fy, cx, cy = params[:4]
+        
+        # 2. 缩放内参以匹配 FAR 输入图像尺寸
+        # 强制转为 float 确保运算安全
+        scale_x = float(target_w) / float(orig_w)
+        scale_y = float(target_h) / float(orig_h)
         
         K = np.array([
             [fx * scale_x, 0, cx * scale_x],
@@ -1113,11 +1135,105 @@ class RelocService:
         
         return torch.from_numpy(K).unsqueeze(0).cuda()
 
+    def get_db_image_gray(self, db_name: str) -> np.ndarray:
+        """读取并缓存库图的灰度图像
+        
+        Args:
+            db_name: 库图文件名，例如 "00001.png" 或 "00001"
+        Returns:
+            灰度图的 numpy 数组 (H, W)
+        """
+        # 1. 优先命中内存缓存
+        if db_name in self._db_image_cache:
+            return self._db_image_cache[db_name]
+
+        # 2. 构建并校验路径 (支持自动补齐后缀)
+        img_path = self.color_dir / db_name
+        if not img_path.exists():
+            for ext in ['.png', '.jpg', '.jpeg']:
+                alt_path = self.color_dir / f"{db_name}{ext}"
+                if alt_path.exists():
+                    img_path = alt_path
+                    break
+
+        if not img_path.exists():
+            raise FileNotFoundError(f"未找到库图文件: {img_path}")
+
+        # 3. 读取为灰度图 (cv2.IMREAD_GRAYSCALE)
+        gray_img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if gray_img is None:
+            raise ValueError(f"库图图像损坏或无法解码: {img_path}")
+
+        # 4. 写入缓存并返回
+        self._db_image_cache[db_name] = gray_img
+        return gray_img
+
+
+    def get_db_camera_params(self, db_name: str = None):
+        """获取相机内参 [fx, fy, cx, cy]"""
+        if self._camera_params_cache is None:
+            self._parse_camera_info_file()
+        return self._camera_params_cache
+
+    def _parse_camera_info_file(self):
+        """安全解析 key=value 格式的 camera_info.txt 文件
+        
+        彻底避免分割 local_transform (含空格和多个=) 导致的字符串转 float 崩溃问题。
+        """
+        if not self.camera_info_path.exists():
+            raise FileNotFoundError(f"相机内参文件不存在: {self.camera_info_path}")
+
+        parsed_params = None
+
+        with open(self.camera_info_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 过滤空行与注释
+                if not line or line.startswith('#'):
+                    continue
+                
+                # 精准匹配 params= 行，忽略 local_transform、camera_model 等复杂行
+                if line.startswith('params='):
+                    raw_val = line[len('params='):].strip()  # 截取 "752.560669,751.958862,641.847534,357.389160"
+                    try:
+                        parsed_params = [float(x.strip()) for x in raw_val.split(',') if x.strip()]
+                    except ValueError as e:
+                        raise ValueError(f"内参 params 字段格式错误: {raw_val}") from e
+                    break  # 找到 params 后即可退出循环
+
+        if not parsed_params:
+            raise KeyError(f"在内参文件 {self.camera_info_path} 中未找到有效的 'params=' 配置行")
+
+        # 校验参数数量 (PINHOLE 相机通常为 fx, fy, cx, cy 4 个值)
+        if len(parsed_params) < 4:
+            raise ValueError(f"解析得到的相机内参数量少于 4 个: {parsed_params}")
+
+        self._camera_params_cache = parsed_params
 
     def localize(self, image_bgr: np.ndarray, request: dict | None = None) -> dict:
         """基于 FAR (Feature-Augmented RANSAC) 的单图重定位流程。"""
         request = request or {}
         
+        ## 测试分析request的数据有哪些
+        # try:
+        #     # 1. 打印结构和类型
+        #     logger.info("=== 收到客户端 request 原型 ===")
+        #     logger.info("request 类型: %s", type(request))
+        #     logger.info("request 内容: %s", request)
+        #     if request:
+        #         for k, v in request.items():
+        #             logger.info(" Key: %-20s | Type: %-15s | Value: %s", k, type(v), v)
+
+        #     # 2. 保存 request 到本地 JSON 文件
+        #     with open("debug_request.json", "w", encoding="utf-8") as f:
+        #         json.dump(request, f, indent=4, ensure_ascii=False, default=str)
+            
+        #     # 3. 顺便保存一张真实接收到的图片（用于后续本地离线测试）
+        #     cv2.imwrite("debug_query.jpg", image_bgr)
+        #     logger.info(">>> 已将真实 request 保存至 debug_request.json，图片保存至 debug_query.jpg")
+        # except Exception as e:
+        #     logger.error("保存调试数据失败: %s", e)
+            
         # 1. 动态参数获取
         num_retrieval = int(request.get("num_retrieval", self.num_retrieval))
         fallback_to_nearest_db = bool(request.get("fallback_to_nearest_db", self.fallback_to_nearest_db))
@@ -1170,7 +1286,7 @@ class RelocService:
             img0_tensor = torch.from_numpy(gray_query_resized).float()[None, None].cuda() / 255.0
 
             # 构建 Query 图内参 K0
-            K0 = _build_far_intrinsics(camera_params, curr_h, curr_w, far_h, far_w)
+            K0 = self._build_far_intrinsics(camera_params, curr_h, curr_w, far_h, far_w)
 
             # 针对 Top-K 检索图，尝试用 FAR 估计相对位姿 (优先尝试 Top-1 或根据得分排序逐个匹配)
             time_far = time.perf_counter()
@@ -1186,7 +1302,7 @@ class RelocService:
 
                 gray_db_resized = cv2.resize(db_image_data, (far_w, far_h))
                 img1_tensor = torch.from_numpy(gray_db_resized).float()[None, None].cuda() / 255.0
-                K1 = _build_far_intrinsics(db_cam_params, db_h, db_w, far_h, far_w)
+                K1 = self._build_far_intrinsics(db_cam_params, db_h, db_w, far_h, far_w)
 
                 # 组装 FAR 输入 Batch 结构
                 batch = {
@@ -1222,7 +1338,7 @@ class RelocService:
                     num_corres = int(out_batch.get("num_corres", [0])[0]) if "num_corres" in out_batch else 1
 
                     cand_result = {
-                        "T_0to1": _to_4x4_matrix(T_0to1_pred),
+                        "T_0to1": self._to_4x4_matrix(T_0to1_pred),
                         "db_name": db_name,
                         "score": num_corres
                     }
@@ -1313,7 +1429,7 @@ class RelocService:
 
         return response
 
-    def localize_loc(self, image_bgr: np.ndarray, request: dict | None = None) -> dict:
+    def localize_hloc(self, image_bgr: np.ndarray, request: dict | None = None) -> dict:
         """单图重定位主流程：全局检索 -> 局部特征 -> 匹配建 2D-3D 对应 -> PnP 估计位姿。"""
         request = request or {}
         # 请求级参数缺省时回落到服务启动时的默认值

@@ -1232,6 +1232,8 @@ def make_server_handler(
             active_service = manager.get_service(str(map_name))
         response = active_service.localize(image, objs)
         minimal_response = build_minimal_server_response(response)
+        
+        # 打印日志：内点数、内点率、位姿矩阵
         if log_server_response:
             logger.info("response: num_inliers=%d, inlier_ratio=%f", minimal_response["num_inliers"], minimal_response["inlier_ratio"])
             logger.info("pose=%s", minimal_response["pose"])
