@@ -1,122 +1,133 @@
 import os
 import sys
 import glob
+import argparse
 import traceback
 import cv2
-import numpy as np
 import torch
+from pathlib import Path
 
-# 1. 导入你的类 (请将 relocalization_server 改为你实际的文件名，RelocalizationServer 改为实际类名)
+# ==============================================================================
+# 1. 导入服务端模块 (若你的服务端文件名不是 server.py，请修改此处的 `server`)
+# ==============================================================================
+SERVER_MODULE_NAME = "run_reloc_server_old"  # <--- 请根据实际 Server 文件名修改（不要写 .py 后缀）
+
 try:
-    from relocalization_server import RelocalizationServer
+    server_module = __import__(SERVER_MODULE_NAME)
+    build_service = server_module.build_service
+    make_server_handler = server_module.make_server_handler
+    print(f"✅ 成功导入服务构建函数: {SERVER_MODULE_NAME}.py")
 except ImportError:
-    print("❌ 导入失败！请检查文件路径或类名。")
-    print("请确认 `relocalization_server.py` 在当前目录下，且类名匹配。")
+    print(f"❌ 导入失败！在当前目录下未找到 `{SERVER_MODULE_NAME}.py` 文件。")
+    print("请修改脚本开头的 `SERVER_MODULE_NAME = '你的服务端文件名'`。")
     sys.exit(1)
 
 
-def run_test():
-    dataset_dir = "../test/scan1"
-    color_dir = os.path.join(dataset_dir, "color")
-    camera_info_path = os.path.join(dataset_dir, "camera_info.txt")
+def run_local_test():
+    dataset_dir = "../test"
+    map_dir = os.path.join(dataset_dir, "hloc_map")
+    color_dir = os.path.join(dataset_dir, "scan1/color")
 
-    print("=" * 60)
-    print("🚀 开始本地重定位流程调试与测试...")
+    print("\n" + "=" * 60)
+    print("🚀 开始本地 RelocService 本地完整流程自测...")
     print("=" * 60)
 
     # -------------------------------------------------------------
-    # 步骤 1: 检查本地数据集文件是否存在
+    # Step 1: 检查本地图片数据
     # -------------------------------------------------------------
     if not os.path.exists(color_dir):
         print(f"❌ 目录不存在: {os.path.abspath(color_dir)}")
         return
 
-    # 获取 color 文件夹下的图片列表
     image_files = sorted(glob.glob(os.path.join(color_dir, "*.*")))
     if not image_files:
         print(f"❌ 在 {color_dir} 下未找到任何图片文件！")
         return
-    
-    print(f"✅ 找到 {len(image_files)} 张数据库图片。")
-    test_db_filename = os.path.basename(image_files[0])  # 挑选第一张作为 DB 图测试
-    test_query_img_path = image_files[-1] if len(image_files) > 1 else image_files[0] # 挑选另一张作为 Query 图
-    
-    print(f"   ├─ 选中测试 DB 图片名: {test_db_filename}")
-    print(f"   └─ 选中测试 Query 图路径: {test_query_img_path}")
+
+    test_image_path = image_files[0]
+    print(f"✅ 找到 {len(image_files)} 张本地图，选取测试图: {os.path.basename(test_image_path)}")
 
     # -------------------------------------------------------------
-    # 步骤 2: 实例化服务对象
+    # Step 2: 构建测试所需的 service_args 参数对象
     # -------------------------------------------------------------
-    print("\n[Step 1/4] 正在初始化 Server 对象...")
+    print("\n[Step 1/3] 配置并构造 service_args...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    local_cache_device = device
+
+    # 模拟命令行解析得到的参数结构体
+    service_args = argparse.Namespace(
+        root_dir=Path(dataset_dir),
+        map_dir=Path(map_dir),
+        image_path=Path(color_dir),
+        retrieval_conf="megaloc",           # 检索配置名，按实际改
+        local_feature_conf="superpoint_inloc", # 局部特征配置名，按实际改
+        matcher_conf="superglue",          # 匹配器配置名，按实际改
+        num_retrieval=20,
+        num_match_db=8,
+        min_correspondences=256,
+        min_matched_db=1,
+        ransac_thresh=12.0,
+        train_list=None,
+        default_camera_model="PINHOLE",
+        default_camera_params="752.560669,751.958862,641.847534,357.389160",
+        fallback_to_nearest_db=True,
+        retvis=False,
+        rotation_augmentation=False,
+    )
+
+    # -------------------------------------------------------------
+    # Step 3: 实例化 RelocService 与 Handler
+    # -------------------------------------------------------------
+    print("\n[Step 2/3] 正在通过 build_service 实例化 RelocService...")
     try:
-        # 如果你的类 __init__ 接受 base_dir，请在此传入
-        server = RelocalizationServer(base_dir=dataset_dir)
-        print("✅ Server 初始化成功。")
+        service_instance = build_service(
+            service_args=service_args,
+            device=device,
+            local_cache_device=local_cache_device,
+            map_name=None,
+        )
+        print("✅ RelocService 实例化成功！")
+
+        # 构造顶层 handler 处理函数 (与 netcall 上调用的 handler 一致)
+        handler = make_server_handler(service=service_instance, manager=None, log_server_response=True)
+        print("✅ make_server_handler 包装成功！")
+
     except Exception:
-        print("❌ Server 初始化失败，详细堆栈如下：")
+        print("\n❌ 服务构建阶段抛出异常！详细堆栈信息：")
         traceback.print_exc()
         return
 
     # -------------------------------------------------------------
-    # 步骤 3: 专门测试内参解析 & 灰度图读取
+    # Step 4: 读取测试图像并构造请求包 objs
     # -------------------------------------------------------------
-    print("\n[Step 2/4] 测试 get_db_camera_params 和 get_db_image_gray...")
-    try:
-        db_params = server.get_db_camera_params(test_db_filename)
-        print(f"✅ 成功提取内参: {db_params}")
-
-        db_gray_img = server.get_db_image_gray(test_db_filename)
-        print(f"✅ 成功读取库图灰度图，图像 Shape: {db_gray_img.shape}, dtype: {db_gray_img.dtype}")
-    except Exception:
-        print("❌ 读取内参或库图失败，详细堆栈如下：")
-        traceback.print_exc()
+    print("\n[Step 3/3] 准备请求数据并执行重定位推理...")
+    image_bgr = cv2.imread(test_image_path)
+    if image_bgr is None:
+        print(f"❌ 读取图像失败: {test_image_path}")
         return
 
-    # -------------------------------------------------------------
-    # 步骤 4: 构造模拟 Request 数据包
-    # -------------------------------------------------------------
-    print("\n[Step 3/4] 构造测试 Request 数据包...")
-    # 模拟真实 Query 图数据 (读取 BGR 数组)
-    query_bgr = cv2.imread(test_query_img_path)
-    if query_bgr is None:
-        print(f"❌ 读取 Query 图片失败: {test_query_img_path}")
-        return
-
-    # 模拟客户端发送的内参字符串或列表
-    mock_camera_params = "752.560669,751.958862,641.847534,357.389160"
-
-    mock_request = {
-        "image": query_bgr,               # 传入 query 图像 (numpy 数组)
-        "camera_params": mock_camera_params,  # 传入字符串形式内参，测试切割兼容性
-        "db_name": test_db_filename       # 目标 DB 图片名
+    # 模拟网络接收到的反序列化数据字典
+    objs = {
+        "image": image_bgr,
+        "camera_params": "752.560669,751.958862,641.847534,357.389160",
+        "db_name": os.path.basename(test_image_path),
     }
-    print("✅ Request 数据构造完成。")
 
-    # -------------------------------------------------------------
-    # 步骤 5: 调用核心定位函数 (如 localize / process)
-    # -------------------------------------------------------------
-    print("\n[Step 4/4] 执行重定位核心算法流程...")
     try:
-        # 假设你的主入口函数名为 localize，如果叫 process_request 或其他名字请修改此处
-        if hasattr(server, 'localize'):
-            result = server.localize(mock_request)
-        elif hasattr(server, 'process'):
-            result = server.process(mock_request)
-        else:
-            print("⚠️ 未找到 localize 或 process 入口方法，请确认你的调用方法名。")
-            return
+        # 直接调用 handler 模拟服务端接收网络请求的整套动作
+        response = handler(objs)
 
         print("\n" + "=" * 60)
-        print("🎉 测试通过！推理成功返回！")
+        print("🎉 测试通过！服务端成功处理请求，返回最小化响应：")
         print("=" * 60)
-        print("返回结果:", result)
+        print("Response 内容:", response)
 
     except Exception:
         print("\n" + "!" * 60)
-        print("💥 推理过程中捕获到异常！错误堆栈信息如下：")
+        print("💥 localize / 推理执行过程中捕获到异常！详细堆栈信息：")
         print("!" * 60)
         traceback.print_exc()
 
 
 if __name__ == "__main__":
-    run_test()
+    run_local_test()

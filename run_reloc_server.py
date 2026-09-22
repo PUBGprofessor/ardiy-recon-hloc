@@ -1239,7 +1239,7 @@ class RelocService:
         fallback_to_nearest_db = bool(request.get("fallback_to_nearest_db", self.fallback_to_nearest_db))
         rotation_augmentation = bool(request.get("rotation_augmentation", self.rotation_augmentation))
         camera_model = request.get("camera_model", self.default_camera_model)
-        camera_params = request.get("camera_params", self.default_camera_params)
+        camera_params = request.get("camera_params", self.default_camera_params) # str字符串
 
         logger.info("Received FAR localization request with image shape %s", image_bgr.shape)
 
