@@ -32,6 +32,7 @@ import PIL.Image
 import pycolmap
 import torch
 import torch.nn.functional as F
+import os
 
 from hloc import extract_features, logger, match_features, matchers
 from hloc.localize_sfm import QueryLocalizer
@@ -43,6 +44,18 @@ import sys
 #e.g. python run_reloc_server.py --map_dir "F:\dev2\prjs1\data1\office2\hloc_map" --default_camera_model PINHOLE --default_camera_params "615.0,615.0,320.0,240.0" 
 # --test_image "F:\dev2\prjs1\data1\office2\scan2\color\000001.jpg" --device cuda --gpu_id 0
 
+import logging
+logger = logging.getLogger(__name__)
+
+# 1. 将 mp3d_loftr 目录添加到 Python 模块搜索路径中
+mp3d_dir = Path(__file__).resolve().parent / "mp3d_loftr"
+if str(mp3d_dir) not in sys.path:
+    sys.path.insert(0, str(mp3d_dir))
+
+# 2. 此时可以直接导入 src，mp3d_loftr 内部的绝对导入也会正常工作
+from src.config.default import get_cfg_defaults
+from src.lightning.lightning_loftr import PL_LoFTR
+import pytorch_lightning as pl
 
 # 图像预处理默认配置：不转灰度、不缩放，缩放插值使用 OpenCV 的 INTER_AREA
 DEFAULT_PREPROCESSING = {
@@ -593,8 +606,127 @@ class RelocService:
         logger.info("Building 2D-3D lookup cache...")
         self.db_point3d_ids = self._build_db_point3d_cache()
 
+
+        """初始化重定位服务并加载 FAR 模型。
+        
+        :param ckpt_path: FAR 权重文件路径 (.ckpt)
+        :param config_path: 配置文件路径 (.yaml)，可选
+        :param far_h: 输入 FAR 网络的目标高度 (默认 480)
+        :param far_w: 输入 FAR 网络的目标宽度 (默认 640)
+        :param device: 运行设备 ('cuda' 或 'cpu')
+        """
+        device = "cuda"
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.far_h = 480
+        self.far_w = 640
+        ckpt_path = "mp3d_loftr\\pretrained_models\\far_8pt.ckpt"
+
+        # 初始化并加载 FAR 模型至 self.far_model
+        logger.info("Initializing FAR model...")
+        self.far_model = self._init_far_model(ckpt_path, None)
+        logger.info("FAR model loaded successfully.")
+
         # 预热模型，消化 CUDA kernel 编译等一次性开销
         self._warmup()
+
+    def _init_far_model(self, ckpt_path: str, config_path: str = None) -> torch.nn.Module:
+        """参考 demo.py 的模型加载逻辑构建 far_model"""
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+
+        # 1. 加载默认配置 (get_cfg_defaults) 并合并配置文件
+        config = get_cfg_defaults()
+        if config_path and os.path.exists(config_path):
+            config.merge_from_file(config_path)
+
+        else:
+            # 1. 允许 YACS 动态新增节点（非常关键！否则直接赋值未定义 key 会报错）
+            config.defrost()
+            config.set_new_allowed(True)
+
+            # -----------------------------------------------------------------
+            # 2. 基础防崩溃参数 (解决 KeyError: 'from_saved_preds')
+            # -----------------------------------------------------------------
+            config.LOFTR.FROM_SAVED_PREDS = None
+            config.LOAD_PREDICTIONS_PATH = None
+            config.EVAL_SPLIT = "test"
+            config.PL_VERSION = getattr(pl, "__version__", "1.0.0")
+            config.EXP_NAME = "far_inference"
+
+            # -----------------------------------------------------------------
+            # 3. FAR 核心计算与求解器参数
+            # -----------------------------------------------------------------
+            config.LOFTR.REGRESS_RT = True                       # 开启旋转/平移位姿回归
+            config.LOFTR.SOLVER = "prior_ransac"                 # 使用 FAR 论文的核心求解器
+            config.LOFTR.PREDICT_TRANSLATION_SCALE = False
+            config.LOFTR.USE_MANY_RANSAC_THR = True
+            config.LOFTR.FINE_PRED_STEPS = 2
+            config.LOFTR.TRAINING = False                        # 强制设为推理模式
+
+            # -----------------------------------------------------------------
+            # 4. REGRESS 结构子节点 (确保与 FAR 权重结构严格对齐)
+            # -----------------------------------------------------------------
+            if not hasattr(config.LOFTR, "REGRESS"):
+                config.LOFTR.REGRESS = CN()
+                
+            config.LOFTR.REGRESS.USE_POS_EMBEDDING = True
+            config.LOFTR.REGRESS.REGRESS_USE_NUM_CORRES = True
+            config.LOFTR.REGRESS.SAVE_MLP_FEATS = False
+            config.LOFTR.REGRESS.USE_SIMPLE_MOE = True
+            config.LOFTR.REGRESS.USE_2WT = True
+            config.LOFTR.REGRESS.USE_5050_WEIGHT = False
+            config.LOFTR.REGRESS.USE_1WT = False
+            config.LOFTR.REGRESS.SCALE_8PT = True
+            config.LOFTR.REGRESS.SAVE_GATING_WEIGHTS = False
+            config.LOFTR.REGRESS_LOFTR_LAYERS = 1
+
+            # 5. 特征提取与层设置
+            config.LOFTR.COARSE.LAYER_NAMES = ["self", "cross"] * 3
+
+            # 6. 其他开关标志
+            config.USE_CORRESPONDENCE_TRANSFORMER = False
+            config.CORRESPONDENCES_USE_FIT_ONLY = False
+            config.USE_PRED_CORR = False
+            config.STRICT_FALSE = False
+            config.EVAL_FIT_ONLY = False
+
+            # 锁定配置
+            config.freeze()
+
+        # 2. 方式一：如果使用标准 PyTorch Lightning .ckpt 格式，一键装载
+        # try:
+        #     model = PL_LoFTR.load_from_checkpoint(
+        #         checkpoint_path=ckpt_path,
+        #         config=config,
+        #         strict=False
+        #     )
+        # except Exception as e:
+        #     logger.warning(f"PL_LoFTR.load_from_checkpoint 失败: {e}，尝试手动加载 state_dict...")
+            
+        #     # 方式二：传统 torch.load 手动加权 (备选方案)
+        #     model = PL_LoFTR(config)
+        #     checkpoint = torch.load(ckpt_path, map_location="cpu")
+        #     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+            
+        #     # 清理 state_dict 中的 key 前缀 (如 matcher. 或 model.)
+        #     cleaned_state_dict = {}
+        #     for k, v in state_dict.items():
+        #         new_k = k.replace("matcher.", "").replace("model.", "")
+        #         cleaned_state_dict[new_k] = v
+
+        #     model.load_state_dict(cleaned_state_dict, strict=False)
+
+        model = PL_LoFTR(config, pretrained_ckpt=ckpt_path, split="test").eval().cuda()
+
+        # 3. 移动至 GPU 并设置为评估模式
+        model = model.to(self.device)
+        model.eval()
+
+        # 4. 禁用所有参数梯度计算，保障推理效率与显存安全
+        for param in model.parameters():
+            param.requires_grad = False
+
+        return model
 
     def _resolve_db_image_names(self, all_db_name_to_id: dict[str, int]) -> list[str]:
         """确定库图集合：未指定 train_list 时用全部已注册图像，否则按列表筛选并校验。"""
@@ -953,7 +1085,235 @@ class RelocService:
         }
         return mkp_indices, point3d_ids, stats
 
+    def _to_4x4_matrix(rt_matrix: np.ndarray) -> np.ndarray:
+        """将 3x4 变换矩阵补全为 4x4 齐次变换矩阵。"""
+        if rt_matrix.shape == (4, 4):
+            return rt_matrix
+        elif rt_matrix.shape == (3, 4):
+            T = np.eye(4, dtype=rt_matrix.dtype)
+            T[:3, :] = rt_matrix
+            return T
+        else:
+            raise ValueError(f"Invalid RT matrix shape: {rt_matrix.shape}")
+
+    def _build_far_intrinsics(camera_params: list, orig_h: int, orig_w: int, target_h: int, target_w: int) -> torch.Tensor:
+        """构建适应 FAR 输入分辨率的相机内参矩阵 (1, 3, 3)。"""
+        # 假设 PINHOLE 模型参数为 [fx, fy, cx, cy]
+        fx, fy, cx, cy = camera_params[:4]
+        
+        # 缩放内参以匹配 FAR 输入图像尺寸
+        scale_x = target_w / orig_w
+        scale_y = target_h / orig_h
+        
+        K = np.array([
+            [fx * scale_x, 0, cx * scale_x],
+            [0, fy * scale_y, cy * scale_y],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        
+        return torch.from_numpy(K).unsqueeze(0).cuda()
+
+
     def localize(self, image_bgr: np.ndarray, request: dict | None = None) -> dict:
+        """基于 FAR (Feature-Augmented RANSAC) 的单图重定位流程。"""
+        request = request or {}
+        
+        # 1. 动态参数获取
+        num_retrieval = int(request.get("num_retrieval", self.num_retrieval))
+        fallback_to_nearest_db = bool(request.get("fallback_to_nearest_db", self.fallback_to_nearest_db))
+        rotation_augmentation = bool(request.get("rotation_augmentation", self.rotation_augmentation))
+        camera_model = request.get("camera_model", self.default_camera_model)
+        camera_params = request.get("camera_params", self.default_camera_params)
+
+        logger.info("Received FAR localization request with image shape %s", image_bgr.shape)
+
+        timings = {}
+        time_start = time.perf_counter()
+
+        # 旋转增广设置
+        rotation_candidates = [0, 90, 180, 270] if rotation_augmentation else [0]
+        orig_h, orig_w = image_bgr.shape[:2]
+        
+        # FAR 期望的输入网络尺寸 (例如 480x640)
+        far_h = getattr(self, "far_h", 480)
+        far_w = getattr(self, "far_w", 640)
+
+        best_candidate = None
+        global_time_total = 0.0
+        retrieve_time_total = 0.0
+        far_inference_time_total = 0.0
+
+        for rotation_deg in rotation_candidates:
+            image_rotated = self._rotate_image(image_bgr, rotation_deg)
+            curr_h, curr_w = image_rotated.shape[:2]
+
+            # -------------------------------------------------------------
+            # Step 1: 全局检索 (提取描述子并匹配 Top-K 图像)
+            # -------------------------------------------------------------
+            time_global = time.perf_counter()
+            query_desc = self.extract_global(image_rotated)
+            global_time_total += time.perf_counter() - time_global
+
+            time_retrieve = time.perf_counter()
+            retrieved_names, retrieval_scores = self.retrieve(query_desc, num_retrieval)
+            retrieve_time_total += time.perf_counter() - time_retrieve
+
+            if not retrieved_names:
+                continue
+
+            # -------------------------------------------------------------
+            # Step 2: 图像预处理与 FAR Batch 构建
+            # -------------------------------------------------------------
+            # 转换灰度图、Resize 并转为 CUDA Tensor (1, 1, H, W)
+            gray_query = cv2.cvtColor(image_rotated, cv2.COLOR_BGR2GRAY)
+            gray_query_resized = cv2.resize(gray_query, (far_w, far_h))
+            img0_tensor = torch.from_numpy(gray_query_resized).float()[None, None].cuda() / 255.0
+
+            # 构建 Query 图内参 K0
+            K0 = _build_far_intrinsics(camera_params, curr_h, curr_w, far_h, far_w)
+
+            # 针对 Top-K 检索图，尝试用 FAR 估计相对位姿 (优先尝试 Top-1 或根据得分排序逐个匹配)
+            time_far = time.perf_counter()
+            
+            cand_result = None
+            cand_db_name = None
+
+            for db_name in retrieved_names:
+                # 获取库图对象及其图像数据 (可通过缓存或磁盘读取)
+                db_image_data = self.get_db_image_gray(db_name)  # 需在类中实现读取/缓存灰度图
+                db_cam_params = self.get_db_camera_params(db_name)
+                db_h, db_w = db_image_data.shape[:2]
+
+                gray_db_resized = cv2.resize(db_image_data, (far_w, far_h))
+                img1_tensor = torch.from_numpy(gray_db_resized).float()[None, None].cuda() / 255.0
+                K1 = _build_far_intrinsics(db_cam_params, db_h, db_w, far_h, far_w)
+
+                # 组装 FAR 输入 Batch 结构
+                batch = {
+                    "image0": img0_tensor,
+                    "image1": img1_tensor,
+                    "K0": K0,
+                    "K1": K1,
+                    "depth0": torch.tensor([]).unsqueeze(0).cuda(),
+                    "depth1": torch.tensor([]).unsqueeze(0).cuda(),
+                    "T_0to1": torch.tensor([]).unsqueeze(0).cuda(),
+                    "T_1to0": torch.tensor([]).unsqueeze(0).cuda(),
+                    "dataset_name": ["custom"],
+                    "scene_id": torch.tensor([]).unsqueeze(0).cuda(),
+                    "pair_id": 0,
+                    "pair_names": ("query", db_name),
+                    "loaded_predictions": torch.tensor([]).unsqueeze(0).cuda(),
+                    "lightweight_numcorr": torch.tensor([0]).unsqueeze(0).cuda(),
+                }
+
+                # -------------------------------------------------------------
+                # Step 3: 调用 FAR 前向推理
+                # -------------------------------------------------------------
+                with torch.no_grad():
+                    out_batch = self.far_model.test_step(batch, batch_idx=0, skip_eval=True)
+
+                # 提取 FAR 预测的相对位姿 T_0to1 (3x4 或 4x4)
+                if "loftr_rt" in out_batch and out_batch["loftr_rt"] is not None:
+                    T_0to1_pred = out_batch["loftr_rt"].cpu().numpy()
+                    if len(T_0to1_pred.shape) == 3:
+                        T_0to1_pred = T_0to1_pred[0]
+                    
+                    # 获取匹配点对数或质量评估分 (若模型输出内点数/对应数)
+                    num_corres = int(out_batch.get("num_corres", [0])[0]) if "num_corres" in out_batch else 1
+
+                    cand_result = {
+                        "T_0to1": _to_4x4_matrix(T_0to1_pred),
+                        "db_name": db_name,
+                        "score": num_corres
+                    }
+                    cand_db_name = db_name
+                    break  # 找到可成功估算相对位姿的 DB 图像即可跳出 (或继续循环选 score 最高的)
+
+            far_inference_time_total += time.perf_counter() - time_far
+
+            score_tuple = (cand_result["score"] if cand_result else 0,)
+
+            candidate = {
+                "rotation_deg": rotation_deg,
+                "result": cand_result,
+                "retrieved_names": retrieved_names,
+                "retrieval_scores": retrieval_scores,
+                "score": score_tuple,
+            }
+
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+
+        # -------------------------------------------------------------
+        # Step 4: 位姿推导与 Fallback 兜底
+        # -------------------------------------------------------------
+        best_result = best_candidate["result"]
+        retrieved_names = best_candidate["retrieved_names"]
+        retrieval_scores = best_candidate["retrieval_scores"]
+        best_rotation_deg = int(best_candidate["rotation_deg"])
+
+        used_fallback = False
+        cam_from_world = None
+
+        if best_result is not None:
+            T_0to1 = best_result["T_0to1"]
+            matched_db_name = best_result["db_name"]
+            
+            # 1. 获取 DB 图像的世界坐标位姿 T_db_from_world
+            db_image_obj = self.reconstruction.images[self.db_name_to_id[matched_db_name]]
+            T_db_from_world = db_image_obj.cam_from_world().to_matrix()  # 4x4 矩阵
+
+            # 2. 几何推导：T_query_from_world = (T_0to1)^(-1) * T_db_from_world
+            T_query_from_world_rot = np.linalg.inv(T_0to1) @ T_db_from_world
+
+            # 3. 若存在图像旋转增广，对相对旋转做 Z 轴角度补偿
+            if best_rotation_deg != 0:
+                rad = np.radians(-best_rotation_deg)
+                R_z = np.array([
+                    [np.cos(rad), -np.sin(rad), 0, 0],
+                    [np.sin(rad),  np.cos(rad), 0, 0],
+                    [0,            0,           1, 0],
+                    [0,            0,           0, 1]
+                ], dtype=np.float64)
+                cam_from_world = R_z @ T_query_from_world_rot
+            else:
+                cam_from_world = T_query_from_world_rot
+
+        elif fallback_to_nearest_db and retrieved_names:
+            # PnP/FAR 失败时回退到距离最近的 Top-1 库图位姿
+            used_fallback = True
+            nearest = self.reconstruction.images[self.db_name_to_id[retrieved_names[0]]]
+            cam_from_world = nearest.cam_from_world().to_matrix()
+
+        # -------------------------------------------------------------
+        # Step 5: 耗时统计与响应构建
+        # -------------------------------------------------------------
+        timings["global_s"] = float(global_time_total)
+        timings["retrieve_s"] = float(retrieve_time_total)
+        timings["far_inference_s"] = float(far_inference_time_total)
+        timings["total_s"] = time.perf_counter() - time_start
+
+        response = {
+            "status": "ok" if cam_from_world is not None else "failed",
+            "pose": serialize_cam_from_world(cam_from_world) if cam_from_world is not None else None,
+            "used_fallback": used_fallback,
+            "retrieval": [
+                {"db_name": name, "score": float(score)}
+                for name, score in zip(retrieved_names, retrieval_scores)
+            ],
+            "timings": {key: float(value) for key, value in timings.items()},
+            "config": {
+                "map_name": self.map_name,
+                "num_retrieval": num_retrieval,
+                "rotation_augmentation": rotation_augmentation,
+                "best_rotation_deg": best_rotation_deg,
+                "solver": "FAR_LoFTR",
+            },
+        }
+
+        return response
+
+    def localize_loc(self, image_bgr: np.ndarray, request: dict | None = None) -> dict:
         """单图重定位主流程：全局检索 -> 局部特征 -> 匹配建 2D-3D 对应 -> PnP 估计位姿。"""
         request = request or {}
         # 请求级参数缺省时回落到服务启动时的默认值
@@ -975,6 +1335,7 @@ class RelocService:
         query_camera = build_camera_from_array(image_bgr, camera_model, camera_params)
         timings["camera_s"] = time.perf_counter() - time_start
 
+        # 为了应对手机拍摄或设备翻转导致的图像重定向问题，开启 rotation_augmentation 后会对 4 个方向分别尝试定位。
         # 旋转增广：开启时对 0/90/180/270 四个朝向分别定位，按 (内点数, 内点率, 对应数) 字典序选最优
         rotation_candidates = [0, 90, 180, 270] if rotation_augmentation else [0]
         original_height, original_width = image_bgr.shape[:2]
