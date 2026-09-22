@@ -65,7 +65,7 @@ def run_local_test():
         num_retrieval=20,
         num_match_db=8,
         min_correspondences=256,
-        min_matched_db=1,
+        min_matched_db=4,
         ransac_thresh=12.0,
         train_list=None,
         default_camera_model="PINHOLE",
